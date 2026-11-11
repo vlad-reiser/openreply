@@ -16,7 +16,13 @@
 
 import Redis from "ioredis";
 
-const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
+// Meta's documented cap is 750/hour. Self-hosters can lower it for headroom
+// (e.g. RATE_LIMIT_MAX_PER_HOUR=200) so a viral post is spread out instead of
+// sent as one burst. Invalid or missing values fall back to 750.
+const RATE_LIMIT_MAX = (() => {
+  const n = Number(process.env.RATE_LIMIT_MAX_PER_HOUR);
+  return Number.isInteger(n) && n > 0 && n <= 750 ? n : 750;
+})();
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
