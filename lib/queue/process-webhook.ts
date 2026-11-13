@@ -3,7 +3,15 @@ import { getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/cli
 import { parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 
-const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
+// Minutes after a user READS the opening DM without tapping before the link is
+// sent anyway. OPENING_DM_READ_FALLBACK_MINUTES=0 turns it off, so the link is
+// only ever sent after a tap. Default 5 keeps upstream behaviour.
+const OPENING_DM_READ_FALLBACK_MINUTES = (() => {
+  const raw = process.env.OPENING_DM_READ_FALLBACK_MINUTES;
+  const n = raw === undefined || raw === "" ? 5 : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 5;
+})();
+const OPENING_DM_READ_FALLBACK_DELAY_MS = OPENING_DM_READ_FALLBACK_MINUTES * 60 * 1000;
 type InstagramPayload = Parameters<typeof parseCommentEvents>[0];
 
 export async function processInstagramWebhook({ payload: incoming, provider, workspaceId }: {
@@ -135,7 +143,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       payload as Parameters<typeof parseReadEvents>[0]
     );
 
-    for (const event of readEvents) {
+    for (const event of OPENING_DM_READ_FALLBACK_MINUTES > 0 ? readEvents : []) {
       const openingLogs = await prisma.dmLog.findMany({
         where: {
           commenterId: event.userId,

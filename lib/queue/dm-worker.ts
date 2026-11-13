@@ -1403,8 +1403,17 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     // postback path's fail-open one. Fail-open is only safe after a tap, where
     // the user has already claimed to follow; here it would hand the link to
     // anyone whose status the API happens not to resolve.
+    // Same opening-DM flow as a comment: a DM (or Story reply) that matches
+    // gets the opening message with its button first, and the tap delivers
+    // the reveal (or the follow gate). Without this, DM triggers skipped the
+    // opening DM and sent the link straight away.
+    const useOpeningDm =
+      automation.openingDmEnabled &&
+      Boolean(automation.openingDmMessage) &&
+      Boolean(automation.openingDmButtonLabel);
+
     let sendFollowPrompt = false;
-    if (automation.requireFollow) {
+    if (automation.requireFollow && !useOpeningDm) {
       const follows = await getUserFollowStatus({
         context: accessToken,
         recipientId: senderId,
@@ -1438,7 +1447,21 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     }
 
     try {
-      if (sendFollowPrompt) {
+      if (useOpeningDm) {
+        const openingText = renderMessageWithTracking({
+          message: automation.openingDmMessage as string,
+          commenterName,
+          trackedLinks: [],
+        });
+        await sendDirectMessageWithButton({
+          context: accessToken,
+          instagramAccountId: automation.instagramAccount.instagramId,
+          userId: senderId,
+          text: openingText,
+          buttonTitle: automation.openingDmButtonLabel as string,
+          payload: `${automation.requireFollow ? "followcheck" : "reveal"}:${automation.id}:open`,
+        });
+      } else if (sendFollowPrompt) {
         const promptText = renderMessageWithoutLink({
           message:
             automation.followPromptMessage ||
