@@ -52,6 +52,8 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { parseCard } from "@/lib/tracking/card";
+import { sendDirectMessageCard } from "@/lib/meta/client";
 import { hashRecipientId } from "@/lib/tracking/server";
 
 import { ZernioApiError } from "@/lib/zernio/client";
@@ -209,6 +211,46 @@ async function sendRevealDirectMessage({
   commenterName: string | null;
   context: string;
 }): Promise<void> {
+  const { text: cardText, card } = parseCard(automation.dmMessage);
+  if (card && automation.trackedLinks.length === 0 && accessToken.provider === "META") {
+    // Card campaigns: a short text, then the link as an image card with a
+    // button. If Meta rejects the card, the bare link goes out as text instead.
+    const intro = cardText.replace(/\{username\}/gi, commenterName ?? "").trim();
+    if (intro) {
+      await sendDirectMessage({
+        context: accessToken,
+        instagramAccountId: automation.instagramAccount.instagramId,
+        userId: userId,
+        message: intro,
+      });
+    }
+    try {
+      await sendDirectMessageCard(
+        accessToken.accessToken,
+        automation.instagramAccount.instagramId,
+        userId,
+        card
+      );
+    } catch (cardError) {
+      if (cardError instanceof TokenExpiredError || cardError instanceof RateLimitError) throw cardError;
+      console.log(
+        `[DM Worker] Card rejected in ${context}, falling back to plain link:`,
+        formatError(cardError)
+      );
+      try {
+        await sendDirectMessage({
+          context: accessToken,
+          instagramAccountId: automation.instagramAccount.instagramId,
+          userId: userId,
+          message: card.url,
+        });
+      } catch (fallbackError) {
+        throw classifySendError(fallbackError);
+      }
+    }
+    return;
+  }
+
   if (automation.trackedLinks.length === 0) {
     await sendDirectMessage({
       context: accessToken,

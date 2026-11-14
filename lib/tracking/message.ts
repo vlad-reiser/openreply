@@ -1,3 +1,4 @@
+import { flattenCard } from "./card";
 export interface MessageTrackedLink {
   slug: string;
   destinationUrl: string;
@@ -79,7 +80,7 @@ export function renderMessageWithTracking({
   baseUrl?: string;
   recipientToken?: string;
 }) {
-  let rendered = message.replace(/\{username\}/gi, commenterName ?? "there");
+  let rendered = flattenCard(message).replace(/\{username\}/gi, commenterName ?? "there");
   const primaryLink = trackedLinks?.[0];
 
   if (!primaryLink) return rendered;

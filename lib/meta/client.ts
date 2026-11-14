@@ -414,6 +414,53 @@ export async function sendDirectMessage(
 }
 
 /**
+ * Send a direct message as a generic template: one card with an image, title,
+ * optional subtitle and a single web_url button. Tapping the image opens the
+ * same URL. The URL itself is never shown as text.
+ */
+export async function sendDirectMessageCard(
+  accessToken: string,
+  instagramAccountId: string,
+  userId: string,
+  card: { imageUrl: string; title: string; subtitle?: string; buttonTitle: string; url: string }
+): Promise<{ recipient_id: string; message_id: string }> {
+  const response = await fetch(
+    `${instagramGraphBase()}/${instagramAccountId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        recipient: { id: userId },
+        message: {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "generic",
+              elements: [
+                {
+                  title: card.title.slice(0, 80),
+                  image_url: card.imageUrl,
+                  ...(card.subtitle ? { subtitle: card.subtitle.slice(0, 80) } : {}),
+                  default_action: { type: "web_url", url: card.url },
+                  buttons: [
+                    { type: "web_url", url: card.url, title: card.buttonTitle.slice(0, 20) },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      }),
+    }
+  );
+
+  return handleResponse(response);
+}
+
+/**
  * Send a direct message as a button template with up to 3 web_url buttons —
  * the reveal message plus tappable link buttons (cleaner than inline URLs).
  */
