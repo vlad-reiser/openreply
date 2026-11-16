@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCurrentWorkspaceId } from "@/lib/auth";
+import { getInboxWorkspaceId } from "@/lib/auth";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
   getConversationMessages,
@@ -23,7 +23,7 @@ type RouteProps = { params: Promise<{ id: string }> };
 
 // Message history for a single conversation (20 most recent, chronological).
 export async function GET(request: NextRequest, { params }: RouteProps) {
-  const workspaceId = await getCurrentWorkspaceId();
+  const workspaceId = await getInboxWorkspaceId();
   if (!workspaceId) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCurrentWorkspaceId } from "@/lib/auth";
+import { getInboxWorkspaceId } from "@/lib/auth";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
   getConversations,
@@ -27,7 +27,7 @@ export interface ConversationsResponse {
 
 // List the account's DM conversations for the inbox.
 export async function GET(request: NextRequest) {
-  const workspaceId = await getCurrentWorkspaceId();
+  const workspaceId = await getInboxWorkspaceId();
   if (!workspaceId) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },
@@ -101,7 +101,7 @@ export async function GET(request: NextRequest) {
 
 // Send a direct message reply.
 export async function POST(request: NextRequest) {
-  const workspaceId = await getCurrentWorkspaceId();
+  const workspaceId = await getInboxWorkspaceId();
   if (!workspaceId) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },

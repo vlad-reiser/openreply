@@ -83,3 +83,20 @@ export async function getCurrentWorkspaceId(): Promise<string | null> {
   const createdWorkspace = await ensureWorkspaceForUser(userId, user?.email);
   return createdWorkspace.id;
 }
+
+/**
+ * Workspace id for the DM inbox, or null. The inbox exposes the account's
+ * private conversations, so only the workspace OWNER may read or send there;
+ * admins and members manage campaigns but never see the inbox.
+ */
+export async function getInboxWorkspaceId(): Promise<string | null> {
+  const userId = await getCurrentUserId();
+  if (!userId) return null;
+  const workspaceId = await getCurrentWorkspaceId();
+  if (!workspaceId) return null;
+  const member = await prisma.workspaceMember.findUnique({
+    where: { workspaceId_userId: { workspaceId, userId } },
+    select: { role: true },
+  });
+  return member?.role === "OWNER" ? workspaceId : null;
+}
