@@ -65,6 +65,9 @@ export interface ProcessFollowUpJob {
   userId: string;
   automationId: string;
   commenterName?: string | null;
+  // Which step of a `[steg]` follow-up sequence this job sends. Absent for the
+  // plain single follow-up.
+  step?: number;
 }
 
 // An inbound DM from a user. Campaigns with `dmTriggerEnabled` whose keywords

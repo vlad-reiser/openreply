@@ -9,6 +9,7 @@ const {
   mockSendDirectMessageWithButton,
   mockSendDirectMessage,
   mockSendDirectMessageWithLinkButton,
+  mockSendDirectMessageCard,
   mockDecryptToken,
   mockMatchKeywords,
   mockReserveDMSlot,
@@ -46,6 +47,7 @@ const {
   mockSendDirectMessageWithButton: vi.fn(),
   mockSendDirectMessage: vi.fn(),
   mockSendDirectMessageWithLinkButton: vi.fn(),
+  mockSendDirectMessageCard: vi.fn(),
   mockDecryptToken: vi.fn(),
   mockMatchKeywords: vi.fn(),
   mockReserveDMSlot: vi.fn(),
@@ -67,6 +69,7 @@ vi.mock("@/lib/meta/client", () => ({
   sendDirectMessageWithButton: mockSendDirectMessageWithButton,
   sendDirectMessage: mockSendDirectMessage,
   sendDirectMessageWithLinkButton: mockSendDirectMessageWithLinkButton,
+  sendDirectMessageCard: mockSendDirectMessageCard,
   sendCommentReply: vi.fn(),
   MetaApiError: class MetaApiError extends Error {
     code: number;
@@ -1763,4 +1766,218 @@ it("retains the public reply claim if sending succeeded but its log write failed
   await process({ ...createMockJob(), id: "next-poll" });
   expect(sendCommentReply).toHaveBeenCalledTimes(1);
   expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+});
+
+describe("DM Worker — follow-up sequence ([steg])", () => {
+  const SEQUENCE = `[steg]
+efter: 60
+tyst: 22-07
+Om du missade den innan 👇
+[kort]
+bild: https://i.ytimg.com/vi/abc/maxresdefault.jpg
+rubrik: Förra videon
+knapp: Titta nu
+länk: https://www.youtube.com/watch?v=abc
+[steg]
+efter: 120
+tyst: 22-07
+hoppa-om: auto_analys 90
+ja-knapp: Ja!
+Snabb fråga 👀 Vill du ha analysen?
+[svar]
+Varsågod! 🙌
+[kort]
+bild: https://example.com/a.png
+rubrik: Analys
+knapp: Starta
+länk: https://example.com/?utm_content=kw-video-uppfoljning`;
+
+  const sequenceAutomation = {
+    ...mockAutomation,
+    dmMessage: "Här är den",
+    followUpEnabled: true,
+    followUpDelayMinutes: 0,
+    followUpMessage: SEQUENCE,
+  };
+
+  function stepJob(step: number | undefined, id = "followup_job_1") {
+    return {
+      name: "process-followup",
+      id,
+      attemptsMade: 0,
+      data: {
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        automationId: "auto_789",
+        commenterName: "commenter_user",
+        ...(step === undefined ? {} : { step }),
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-22T11:00:00Z")); // 12:00 in Stockholm
+    mockPrisma.automation.findFirst.mockResolvedValue(sequenceAutomation);
+    // findFirst is shared with the recipient-name lookup; only the skip rule
+    // (which filters on a list of campaigns) should come back empty.
+    mockPrisma.dmLog.findFirst.mockImplementation(
+      async (args: { where?: { automationId?: { in?: string[] } } } = {}) =>
+        args.where?.automationId?.in ? null : { commenterName: "commenter_user" }
+    );
+    mockSendDirectMessageCard.mockReset().mockResolvedValue({});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("starts the sequence at step 0 once the reveal is delivered", async () => {
+    await getProcessor()(createMockPostbackJob());
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ automationId: "auto_789", userId: "commenter_999", step: 0 }),
+      expect.objectContaining({
+        delay: 60 * 60_000,
+        jobId: expect.stringMatching(/^followup_auto_789_commenter_999_s0_\d+$/),
+      })
+    );
+  });
+
+  it("sends a step as text plus card, logs it and schedules the next step", async () => {
+    await getProcessor()(stepJob(0));
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendDirectMessage.mock.calls[0]).toContain("Om du missade den innan 👇");
+    expect(mockSendDirectMessageCard).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      expect.objectContaining({ title: "Förra videon", url: "https://www.youtube.com/watch?v=abc" })
+    );
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ commentText: "(uppföljning 1)", status: "SENT" }),
+      })
+    );
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ step: 1 }),
+      expect.objectContaining({ delay: 120 * 60_000 })
+    );
+  });
+
+  it("sends a button step with a postback that points back at the step", async () => {
+    await getProcessor()(stepJob(1));
+    expect(mockSendDirectMessageWithButton).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Snabb fråga 👀 Vill du ha analysen?",
+      "Ja!",
+      "steg:auto_789:1"
+    );
+    expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled(); // last step
+  });
+
+  it("skips a step for someone who used the named campaign recently", async () => {
+    mockPrisma.dmLog.findFirst.mockImplementation(
+      async (args: { where?: { automationId?: { in?: string[] } } } = {}) =>
+        args.where?.automationId?.in
+          ? args.where.automationId.in.includes("auto_analys") ? { id: "log_1" } : null
+          : { commenterName: "commenter_user" }
+    );
+    await getProcessor()(stepJob(1));
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  it("does not repeat the same follow-up to the same person, but moves on", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "SENT",
+      dmDeliveryUnconfirmed: false,
+      updatedAt: new Date("2026-11-01T00:00:00Z"),
+    });
+    await getProcessor()(stepJob(0));
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ step: 1 }),
+      expect.anything()
+    );
+  });
+
+  it("never sends during the quiet hours: a late job is pushed to the morning", async () => {
+    vi.setSystemTime(new Date("2026-11-22T22:30:00Z")); // 23:30 in Stockholm
+    await getProcessor()(stepJob(1));
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ step: 1 }),
+      expect.objectContaining({ delay: 7.5 * 3_600_000 + 60_000 })
+    );
+  });
+
+  it("schedules a step that would land at night for the morning instead", async () => {
+    vi.setSystemTime(new Date("2026-11-22T19:30:00Z")); // 20:30 → step 1 would be 22:30
+    await getProcessor()(stepJob(0));
+    const delay = mockQueueAdd.mock.calls[0][2].delay as number;
+    expect(delay).toBeGreaterThan(10.5 * 3_600_000); // 07:00 next morning
+    expect(delay).toBeLessThanOrEqual(10.5 * 3_600_000 + 15 * 60_000);
+  });
+
+  it("ends the sequence when a step cannot be delivered, without retrying", async () => {
+    mockSendDirectMessage.mockRejectedValue(new MetaApiError(10, undefined, undefined, "outside window"));
+    await expect(getProcessor()(stepJob(0))).resolves.toBeUndefined();
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ create: expect.objectContaining({ status: "FAILED" }) })
+    );
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("answers a tap on a step's button with that step's reply", async () => {
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "steg:auto_789:1",
+        mid: "mid_1",
+      })
+    );
+    expect(mockSendDirectMessage.mock.calls[0]).toContain("Varsågod! 🙌");
+    expect(mockSendDirectMessageCard).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      expect.objectContaining({ url: "https://example.com/?utm_content=kw-video-uppfoljning" })
+    );
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ commentText: "(ja uppföljning 2)", status: "SENT" }),
+      })
+    );
+  });
+
+  it("ignores a tap that points at a step without a reply", async () => {
+    await getProcessor()(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "steg:auto_789:0",
+      })
+    );
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
+  });
+
+  it("keeps the plain single follow-up working", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...sequenceAutomation,
+      followUpMessage: "Tack för att du tittade!",
+    });
+    await getProcessor()(stepJob(undefined));
+    expect(mockSendDirectMessage.mock.calls[0]).toContain("Tack för att du tittade!");
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
 });

@@ -52,7 +52,13 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
-import { parseCard } from "@/lib/tracking/card";
+import { flattenCard, parseCard } from "@/lib/tracking/card";
+import {
+  msUntilAllowed,
+  parseSteps,
+  stepDelayMs,
+  type FollowUpStep,
+} from "@/lib/tracking/steps";
 import { sendDirectMessageCard } from "@/lib/meta/client";
 import { hashRecipientId } from "@/lib/tracking/server";
 
@@ -194,6 +200,68 @@ type RevealAutomation = {
 };
 
 /**
+ * Send a message that may end with a `[kort]` block: a short text, then the
+ * link as an image card with a button. If Meta rejects the card (or the
+ * account is not on Meta), the bare link goes out as text instead.
+ */
+async function sendTextAndCard({
+  accessToken,
+  instagramId,
+  userId,
+  message,
+  commenterName,
+  context,
+}: {
+  accessToken: InstagramContext;
+  instagramId: string;
+  userId: string;
+  message: string;
+  commenterName: string | null;
+  context: string;
+}): Promise<void> {
+  const personalize = (text: string) =>
+    text.replace(/\{username\}/gi, commenterName ?? "").trim();
+  const { text, card } = parseCard(message);
+  if (!card || accessToken.provider !== "META") {
+    await sendDirectMessage({
+      context: accessToken,
+      instagramAccountId: instagramId,
+      userId,
+      message: personalize(flattenCard(message)),
+    });
+    return;
+  }
+  const intro = personalize(text);
+  if (intro) {
+    await sendDirectMessage({
+      context: accessToken,
+      instagramAccountId: instagramId,
+      userId,
+      message: intro,
+    });
+  }
+  try {
+    await sendDirectMessageCard(accessToken.accessToken, instagramId, userId, card);
+  } catch (cardError) {
+    if (cardError instanceof TokenExpiredError || cardError instanceof RateLimitError) throw cardError;
+    console.log(
+      `[DM Worker] Card rejected in ${context}, falling back to plain link:`,
+      formatError(cardError)
+    );
+    try {
+      await sendDirectMessage({
+        context: accessToken,
+        instagramAccountId: instagramId,
+        userId,
+        message: card.url,
+      });
+    } catch (fallbackError) {
+      throw classifySendError(fallbackError);
+    }
+  }
+}
+
+/**
  * Deliver a campaign's reveal message as a direct message. Shared by the
  * button-tap (postback) path and the DM keyword-trigger path — both already
  * have an open conversation with the user, so neither uses a private reply.
@@ -211,43 +279,16 @@ async function sendRevealDirectMessage({
   commenterName: string | null;
   context: string;
 }): Promise<void> {
-  const { text: cardText, card } = parseCard(automation.dmMessage);
+  const { card } = parseCard(automation.dmMessage);
   if (card && automation.trackedLinks.length === 0 && accessToken.provider === "META") {
-    // Card campaigns: a short text, then the link as an image card with a
-    // button. If Meta rejects the card, the bare link goes out as text instead.
-    const intro = cardText.replace(/\{username\}/gi, commenterName ?? "").trim();
-    if (intro) {
-      await sendDirectMessage({
-        context: accessToken,
-        instagramAccountId: automation.instagramAccount.instagramId,
-        userId: userId,
-        message: intro,
-      });
-    }
-    try {
-      await sendDirectMessageCard(
-        accessToken.accessToken,
-        automation.instagramAccount.instagramId,
-        userId,
-        card
-      );
-    } catch (cardError) {
-      if (cardError instanceof TokenExpiredError || cardError instanceof RateLimitError) throw cardError;
-      console.log(
-        `[DM Worker] Card rejected in ${context}, falling back to plain link:`,
-        formatError(cardError)
-      );
-      try {
-        await sendDirectMessage({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          userId: userId,
-          message: card.url,
-        });
-      } catch (fallbackError) {
-        throw classifySendError(fallbackError);
-      }
-    }
+    await sendTextAndCard({
+      accessToken,
+      instagramId: automation.instagramAccount.instagramId,
+      userId,
+      message: automation.dmMessage,
+      commenterName,
+      context,
+    });
     return;
   }
 
@@ -314,6 +355,66 @@ async function sendRevealDirectMessage({
   }
 }
 
+
+// A campaign's follow-up is either one plain message or a `[steg]` sequence.
+// Both are scheduled here, once the link has been delivered.
+type FollowUpSource = {
+  id: string;
+  instagramAccountId: string;
+  followUpEnabled: boolean;
+  followUpMessage: string | null;
+  followUpDelayMinutes: number | null;
+  instagramAccount: { instagramId: string };
+};
+
+// Same-message follow-ups are not repeated to one person within this window.
+const FOLLOWUP_REPEAT_DAYS = 90;
+
+async function enqueueFollowUpStep(
+  data: ProcessFollowUpJob,
+  steps: FollowUpStep[],
+  index: number
+): Promise<void> {
+  const step = steps[index];
+  if (!step) return;
+  // Spread morning sends over a quarter of an hour instead of one minute.
+  const spreadMs = 60_000 + Math.floor(Math.random() * 14 * 60_000);
+  await getDMQueue().add(
+    FOLLOWUP_JOB_NAME,
+    { ...data, step: index },
+    {
+      delay: stepDelayMs(step, new Date(), spreadMs),
+      // Bucketed by hour: a burst of taps starts one sequence, and a retained
+      // completed job never blocks a later one (see the follow re-check note).
+      jobId: `followup_${data.automationId}_${data.userId}_s${index}_${Math.floor(Date.now() / 3_600_000)}`,
+      attempts: 1,
+    }
+  );
+}
+
+async function scheduleFollowUp(
+  automation: FollowUpSource,
+  userId: string,
+  commenterName: string | null
+): Promise<void> {
+  if (!automation.followUpEnabled || !automation.followUpMessage?.trim()) return;
+  const data: ProcessFollowUpJob = {
+    instagramAccountId: automation.instagramAccount.instagramId,
+    accountConnectionId: automation.instagramAccountId,
+    userId,
+    automationId: automation.id,
+    commenterName,
+  };
+  const steps = parseSteps(automation.followUpMessage);
+  if (steps) {
+    await enqueueFollowUpStep(data, steps, 0);
+    return;
+  }
+  await getDMQueue().add(FOLLOWUP_JOB_NAME, data, {
+    delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,
+    jobId: `followup_${automation.id}_${userId}`,
+  });
+}
 
 function connectionScope(data: DmQueueJob) {
   return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
@@ -931,6 +1032,10 @@ async function sendFollowRecheckAck({
 async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   const { instagramAccountId, userId, payload, fallback } = job.data;
 
+  if (payload.startsWith("steg:")) {
+    await processStepReply(job);
+    return;
+  }
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
   // The opening DM's button appends ":open" to the payload; the follow
@@ -1171,24 +1276,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // short thank-you. It is scheduled as its own delayed job so it can go out
     // some minutes later (followUpDelayMinutes) rather than immediately. The
     // deterministic job id dedupes repeat button taps to one follow-up per user.
-    if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-      const delayMs =
-        Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000;
-      await getDMQueue().add(
-        FOLLOWUP_JOB_NAME,
-        {
-          instagramAccountId: automation.instagramAccount.instagramId,
-          accountConnectionId: automation.instagramAccountId,
-          userId,
-          automationId: automation.id,
-          commenterName,
-        },
-        {
-          delay: delayMs,
-          jobId: `followup_${automation.id}_${userId}`,
-        },
-      );
-    }
+    await scheduleFollowUp(automation, userId, commenterName);
     await prisma.dmLog.upsert({
       where: {
         automationId_commentId: {
@@ -1261,6 +1349,252 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
 }
 
 /**
+ * Send one step of a `[steg]` follow-up sequence, then schedule the next.
+ * Best-effort like the plain follow-up: a failed send is logged, not retried,
+ * and ends the sequence for that person.
+ */
+async function sendFollowUpStep(
+  job: Job<ProcessFollowUpJob>,
+  automation: {
+    id: string;
+    workspaceId: string;
+    instagramAccountId: string;
+    instagramAccount: { instagramId: string };
+  },
+  steps: FollowUpStep[],
+  accessToken: InstagramContext
+): Promise<void> {
+  const { userId } = job.data;
+  const commenterName = job.data.commenterName ?? null;
+  const index = job.data.step ?? 0;
+  const step = steps[index];
+  if (!step) return;
+
+  // The delay was computed to land outside the quiet hours; a job that ran
+  // late (worker restart, backlog) is pushed on rather than sent at night.
+  const wait = msUntilAllowed(new Date(), step.quiet);
+  if (wait > 0) {
+    await getDMQueue().add(FOLLOWUP_JOB_NAME, job.data, {
+      delay: wait + 60_000,
+      jobId: `${job.id}_q`,
+      attempts: 1,
+    });
+    return;
+  }
+
+  const next = () => enqueueFollowUpStep(job.data, steps, index + 1);
+
+  if (step.skipIf) {
+    const used = await prisma.dmLog.findFirst({
+      where: {
+        workspaceId: automation.workspaceId,
+        automationId: { in: step.skipIf.automationIds },
+        commenterId: userId,
+        createdAt: { gte: new Date(Date.now() - step.skipIf.days * 86_400_000) },
+      },
+      select: { id: true },
+    });
+    if (used) {
+      await next();
+      return;
+    }
+  }
+
+  // One row per person and message text: the same follow-up is not repeated,
+  // a changed one (a new video, say) is.
+  const commentId = `steg${index}:${userId}:${createHash("sha256")
+    .update(step.message)
+    .digest("hex")
+    .slice(0, 12)}`;
+  const where = {
+    automationId_commentId: { automationId: automation.id, commentId },
+  };
+  const prior = await prisma.dmLog.findUnique({ where });
+  if (
+    prior &&
+    (prior.status === "SENT" || prior.dmDeliveryUnconfirmed) &&
+    prior.updatedAt.getTime() > Date.now() - FOLLOWUP_REPEAT_DAYS * 86_400_000
+  ) {
+    await next();
+    return;
+  }
+
+  const log = {
+    workspaceId: automation.workspaceId,
+    automationId: automation.id,
+    instagramAccountId: automation.instagramAccountId,
+    commenterId: userId,
+    commenterName,
+    commentText: `(uppföljning ${index + 1})`,
+    commentId,
+  };
+  const instagramId = automation.instagramAccount.instagramId;
+  try {
+    const delivered = await sendPostbackOnce({
+      operationId: createHash("sha256")
+        .update(JSON.stringify(["steg", automation.id, commentId, job.id]))
+        .digest("hex"),
+      send: () =>
+        step.buttonTitle && step.reply
+          ? sendDirectMessageWithButton({
+              context: accessToken,
+              instagramAccountId: instagramId,
+              userId,
+              text: flattenCard(step.message)
+                .replace(/\{username\}/gi, commenterName ?? "")
+                .trim(),
+              buttonTitle: step.buttonTitle,
+              payload: `steg:${automation.id}:${index}`,
+            })
+          : sendTextAndCard({
+              accessToken,
+              instagramId,
+              userId,
+              message: step.message,
+              commenterName,
+              context: "follow-up step",
+            }),
+    });
+    if (!delivered) return;
+  } catch (originalError) {
+    const error = classifySendError(originalError);
+    console.log("[DM Worker] Failed to send follow-up step:", formatError(error));
+    await prisma.dmLog.upsert({
+      where,
+      create: {
+        ...log,
+        status: "FAILED",
+        errorMessage: formatError(error),
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
+      },
+      update: {
+        status: "FAILED",
+        errorMessage: formatError(error),
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
+      },
+    });
+    return;
+  }
+  await prisma.dmLog.upsert({
+    where,
+    create: { ...log, status: "SENT", dmSentAt: new Date() },
+    update: {
+      status: "SENT",
+      dmSentAt: new Date(),
+      errorMessage: null,
+      dmDeliveryUnconfirmed: false,
+    },
+  });
+  await next();
+}
+
+/**
+ * A tap on a follow-up step's button (`steg:<automationId>:<step>`): send that
+ * step's `[svar]` message.
+ */
+async function processStepReply(job: Job<ProcessPostbackJob>): Promise<void> {
+  const { instagramAccountId, userId, payload } = job.data;
+  const [automationId, rawIndex] = payload.slice("steg:".length).split(":");
+  const index = Number(rawIndex);
+
+  const automation = await prisma.automation.findFirst({
+    where: { id: automationId, isActive: true, ...connectionScope(job.data) },
+    include: { instagramAccount: true },
+  });
+  if (
+    !automation ||
+    automation.instagramAccount.instagramId !== instagramAccountId ||
+    !hasInstagramCredentials(automation.instagramAccount)
+  ) {
+    return;
+  }
+  const step = Number.isInteger(index)
+    ? parseSteps(automation.followUpMessage)?.[index]
+    : undefined;
+  if (!step?.reply) return;
+  const reply = step.reply;
+
+  let accessToken: InstagramContext;
+  try {
+    accessToken = await createInstagramContext(
+      automation.instagramAccount,
+      `${job.id}:${automation.id}`
+    );
+  } catch {
+    return;
+  }
+  const commenterName = await resolveRecipientName({
+    context: accessToken,
+    workspaceId: automation.workspaceId,
+    recipientId: userId,
+  });
+
+  const where = {
+    automationId_commentId: {
+      automationId: automation.id,
+      commentId: `stegsvar${index}:${userId}`,
+    },
+  };
+  const log = {
+    workspaceId: automation.workspaceId,
+    automationId: automation.id,
+    instagramAccountId: automation.instagramAccountId,
+    commenterId: userId,
+    commenterName,
+    commentText: `(ja uppföljning ${index + 1})`,
+    commentId: where.automationId_commentId.commentId,
+  };
+  try {
+    const delivered = await sendPostbackOnce({
+      operationId: createHash("sha256")
+        .update(
+          JSON.stringify([
+            "stegsvar",
+            automation.instagramAccountId,
+            automation.id,
+            userId,
+            index,
+            job.data.mid ?? job.id ?? payload,
+          ])
+        )
+        .digest("hex"),
+      send: () =>
+        sendTextAndCard({
+          accessToken,
+          instagramId: automation.instagramAccount.instagramId,
+          userId,
+          message: reply,
+          commenterName,
+          context: "follow-up step reply",
+        }),
+    });
+    if (!delivered) return;
+    await prisma.dmLog.upsert({
+      where,
+      create: { ...log, status: "SENT", dmSentAt: new Date() },
+      update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
+    });
+  } catch (originalError) {
+    const error = classifySendError(originalError);
+    await prisma.dmLog.upsert({
+      where,
+      create: {
+        ...log,
+        status: "FAILED",
+        errorMessage: formatError(error),
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
+      },
+      update: {
+        status: "FAILED",
+        errorMessage: formatError(error),
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
+      },
+    });
+    throw error;
+  }
+}
+
+/**
  * Send the scheduled appreciation follow-up. Runs after its delay elapses.
  * Best-effort: if the message can't be delivered (e.g. the 24-hour messaging
  * window closed because the delay was long), it is logged, not retried forever.
@@ -1292,6 +1626,14 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
   } catch {
     return;
   }
+
+  const steps = parseSteps(automation.followUpMessage);
+  if (steps) {
+    await sendFollowUpStep(job, automation, steps, accessToken);
+    return;
+  }
+  // A step job whose campaign no longer has a sequence: nothing to send.
+  if (job.data.step !== undefined) return;
 
   try {
     await sendDirectMessage({
@@ -1530,22 +1872,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         // The link has been delivered, so the appreciation follow-up applies
         // here exactly as it does after a button tap. Not scheduled behind the
         // follow prompt — no link went out yet in that branch.
-        if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-          await getDMQueue().add(
-            FOLLOWUP_JOB_NAME,
-            {
-              instagramAccountId: automation.instagramAccount.instagramId,
-              accountConnectionId: automation.instagramAccountId,
-              userId: senderId,
-              automationId: automation.id,
-              commenterName,
-            },
-            {
-              delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,
-              jobId: `followup_${automation.id}_${senderId}`,
-            }
-          );
-        }
+        await scheduleFollowUp(automation, senderId, commenterName);
       }
 
       await prisma.dmLog.upsert({
