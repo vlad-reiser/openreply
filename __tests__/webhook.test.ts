@@ -359,6 +359,31 @@ describe("parseMessageEvents", () => {
     } as Parameters<typeof parseMessageEvents>[0];
   }
 
+  it("hands a Story mention on as the mention keyword", () => {
+    const payload = messagingPayload([
+      {
+        sender: { id: "user_999" },
+        recipient: { id: "ig_456" },
+        message: { mid: "mid_story", attachments: [{ type: "story_mention" }] },
+      },
+      {
+        sender: { id: "user_999" },
+        recipient: { id: "ig_456" },
+        message: { mid: "mid_image", attachments: [{ type: "image" }] },
+      },
+    ]);
+
+    expect(parseMessageEvents(payload)).toEqual([
+      {
+        instagramAccountId: "ig_456",
+        messageId: "mid_story",
+        messageText: "storyomnämnande",
+        senderId: "user_999",
+        storyMention: true,
+      },
+    ]);
+  });
+
   it("should parse an inbound DM", () => {
     const payload = messagingPayload([
       {

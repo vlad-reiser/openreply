@@ -39,6 +39,7 @@ const {
     operationalEvent: {
       create: vi.fn(),
     },
+    linkClick: { findMany: vi.fn() },
   },
   mockSendPrivateReply: vi.fn(),
   mockSendPrivateReplyWithLinkButton: vi.fn(),
@@ -1999,6 +2000,79 @@ länk: https://example.com/?utm_content=kw-video-uppfoljning`;
     expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
   });
 
+  it("does not send a step later than 23 hours after the person last wrote", async () => {
+    const job = stepJob(0);
+    await getProcessor()({
+      ...job,
+      data: { ...job.data, windowOpenedAt: Date.now() - 23.5 * 3_600_000 },
+    });
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not queue a next step that would land outside the 24-hour window", async () => {
+    const job = stepJob(0);
+    await getProcessor()({
+      ...job,
+      // Step 2 comes 120 minutes later: 21.5 h + 2 h is past the limit.
+      data: { ...job.data, windowOpenedAt: Date.now() - 21.5 * 3_600_000 },
+    });
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it("stamps the sequence with when the 24-hour window opened", async () => {
+    await getProcessor()(createMockPostbackJob());
+    expect(mockQueueAdd.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ windowOpenedAt: Date.now() })
+    );
+  });
+
+  describe("om-ej-klick (reminder only to people who have not opened the link)", () => {
+    const REMINDER = `[steg]
+efter: 180
+om-ej-klick: ja
+Hann du öppna den?
+[kort]
+bild: https://example.com/a.png
+rubrik: Analys
+knapp: Starta
+länk: https://example.com/analys?utm_campaign=analys`;
+    const trackedLinks = [
+      { slug: "abc123", label: null, destinationUrl: "https://example.com/analys?utm_campaign=analys" },
+    ];
+
+    beforeEach(() => {
+      mockPrisma.automation.findFirst.mockResolvedValue({
+        ...sequenceAutomation,
+        followUpMessage: REMINDER,
+        trackedLinks,
+      });
+      mockPrisma.linkClick.findMany.mockReset().mockResolvedValue([]);
+    });
+
+    it("sends the reminder, through the click counter, when nothing was opened", async () => {
+      await getProcessor()(stepJob(0));
+      expect(mockSendDirectMessage.mock.calls[0]).toContain("Hann du öppna den?");
+      const card = mockSendDirectMessageCard.mock.calls[0][3] as { url: string };
+      expect(card.url).toMatch(/\/r\/abc123\?r=[A-Za-z0-9_-]{22}$/);
+    });
+
+    it("skips the reminder for someone who opened the link", async () => {
+      mockPrisma.linkClick.findMany.mockResolvedValue([{ userAgent: "Mozilla/5.0 (iPhone) Instagram" }]);
+      await getProcessor()(stepJob(0));
+      expect(mockSendDirectMessage).not.toHaveBeenCalled();
+      expect(mockSendDirectMessageCard).not.toHaveBeenCalled();
+    });
+
+    it("does not count a link scanner's visit as the person's", async () => {
+      mockPrisma.linkClick.findMany.mockResolvedValue([{ userAgent: "facebookexternalhit/1.1" }]);
+      await getProcessor()(stepJob(0));
+      expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("keeps the plain single follow-up working", async () => {
     mockPrisma.automation.findFirst.mockResolvedValue({
       ...sequenceAutomation,
@@ -2007,5 +2081,67 @@ länk: https://example.com/?utm_content=kw-video-uppfoljning`;
     await getProcessor()(stepJob(undefined));
     expect(mockSendDirectMessage.mock.calls[0]).toContain("Tack för att du tittade!");
     expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM Worker — Story mention", () => {
+  const mentionAutomation = {
+    ...mockAutomation,
+    dmTriggerEnabled: true,
+    requireFollow: false,
+    openingDmEnabled: false,
+    keywords: ["storyomnämnande"],
+    dmMessage: "Tack för omnämnandet! 🙌",
+  };
+  function mentionJob(data: Record<string, unknown> = {}) {
+    return {
+      name: "process-message",
+      id: "message_job_mention",
+      attemptsMade: 0,
+      data: {
+        instagramAccountId: "ig_456",
+        messageId: "mid_mention",
+        messageText: "storyomnämnande",
+        senderId: "commenter_999",
+        storyMention: true,
+        ...data,
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockPrisma.automation.findMany.mockResolvedValue([mentionAutomation]);
+    // findFirst is shared with the recipient-name lookup; only the
+    // once-a-week check (which filters on status) should come back empty.
+    mockPrisma.dmLog.findFirst.mockImplementation(
+      async (args: { where?: { status?: string } } = {}) =>
+        args.where?.status ? null : { commenterName: "commenter_user" }
+    );
+  });
+
+  it("answers a Story mention with the campaign that names it as a keyword", async () => {
+    await getProcessor()(mentionJob());
+    expect(mockSendDirectMessage).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mockSendDirectMessage.mock.calls[0])).toContain("Tack för omnämnandet!");
+  });
+
+  it("does not answer the same person again within a week", async () => {
+    mockPrisma.dmLog.findFirst.mockImplementation(async () => ({
+      id: "log_recent",
+      commenterName: "commenter_user",
+    }));
+    await getProcessor()(mentionJob());
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+  });
+
+  it("is not answered by an any-word campaign or another keyword", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mentionAutomation, keywords: ["LINK"], matchAnyWord: true },
+    ]);
+    mockMatchKeywords.mockReturnValue({ matched: false, matchedKeyword: null });
+    await getProcessor()(mentionJob());
+    // Asked about the mention keyword, despite "any word" being on.
+    expect(mockMatchKeywords).toHaveBeenCalledWith("storyomnämnande", ["LINK"], true);
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
   });
 });

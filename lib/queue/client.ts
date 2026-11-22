@@ -68,6 +68,9 @@ export interface ProcessFollowUpJob {
   // Which step of a `[steg]` follow-up sequence this job sends. Absent for the
   // plain single follow-up.
   step?: number;
+  // When the person last wrote to us or tapped a button (epoch ms): the start
+  // of Instagram's 24-hour messaging window. Steps are never sent past it.
+  windowOpenedAt?: number;
 }
 
 // An inbound DM from a user. Campaigns with `dmTriggerEnabled` whose keywords
@@ -78,6 +81,8 @@ export interface ProcessMessageJob {
   messageId: string;
   messageText: string;
   senderId: string;
+  // The person mentioned the account in their Story (no text of their own).
+  storyMention?: boolean;
 }
 
 export type DmQueueJob =

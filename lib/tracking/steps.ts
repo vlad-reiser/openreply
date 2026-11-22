@@ -8,6 +8,7 @@
  *   efter: 60                  minutes after the previous message
  *   tyst: 22-07                never send between these hours (local time)
  *   hoppa-om: <campaignId> 90  skip if this person used that campaign in 90 days
+ *   om-ej-klick: ja            send only if the person has not opened the link
  *   ja-knapp: Ja!              send the text with a button ...
  *   Vill du ha analysen?
  *   [svar]                     ... and send this when the button is tapped
@@ -21,6 +22,7 @@ export type FollowUpStep = {
   delayMinutes: number;
   quiet: QuietHours | null;
   skipIf: { automationIds: string[]; days: number } | null;
+  onlyIfNoClick: boolean;
   buttonTitle: string | null;
   message: string;
   reply: string | null;
@@ -28,7 +30,7 @@ export type FollowUpStep = {
 
 const STEP_LINE = /^\s*\[steg\]\s*$/i;
 const REPLY_LINE = /^\s*\[svar\]\s*$/i;
-const HEADER = /^\s*(efter|tyst|hoppa-om|ja-knapp)\s*:\s*(.+?)\s*$/i;
+const HEADER = /^\s*(efter|tyst|hoppa-om|om-ej-klick|ja-knapp)\s*:\s*(.+?)\s*$/i;
 
 export const QUIET_HOURS_TZ = process.env.QUIET_HOURS_TZ || "Europe/Stockholm";
 
@@ -74,6 +76,7 @@ export function parseSteps(message: string | null | undefined): FollowUpStep[] |
       delayMinutes: 0,
       quiet: null,
       skipIf: null,
+      onlyIfNoClick: false,
       buttonTitle: null,
       message: "",
       reply: null,
@@ -87,6 +90,7 @@ export function parseSteps(message: string | null | undefined): FollowUpStep[] |
       if (key === "efter") step.delayMinutes = parseDelay(header[2]);
       else if (key === "tyst") step.quiet = parseQuiet(header[2]);
       else if (key === "hoppa-om") step.skipIf = parseSkip(header[2]);
+      else if (key === "om-ej-klick") step.onlyIfNoClick = /^(ja|yes|true|1)$/i.test(header[2]);
       else step.buttonTitle = header[2].slice(0, 20);
     }
     const body = block.slice(i);

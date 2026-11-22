@@ -92,7 +92,14 @@ export interface WebhookMessageEvent {
   messageId: string;
   messageText: string;
   senderId: string;
+  storyMention?: boolean;
 }
+
+/**
+ * A Story mention arrives as a message with no text. It is handed on as this
+ * word, so a campaign answers mentions by having it as a DM keyword.
+ */
+export const STORY_MENTION_KEYWORD = "storyomnämnande";
 
 export interface WebhookPostbackEvent {
   instagramAccountId: string;
@@ -219,7 +226,10 @@ export function parseMessageEvents(
         continue;
       }
 
-      const text = message.text?.trim();
+      const storyMention =
+        !message.text?.trim() &&
+        (message.attachments ?? []).some((a) => a.type === "story_mention");
+      const text = storyMention ? STORY_MENTION_KEYWORD : message.text?.trim();
       const messageId = message.mid;
       const senderId = messaging.sender?.id;
       const accountId = entry.id ?? messaging.recipient?.id;
@@ -233,6 +243,7 @@ export function parseMessageEvents(
         messageId,
         messageText: text,
         senderId,
+        ...(storyMention ? { storyMention: true } : {}),
       });
     }
   }

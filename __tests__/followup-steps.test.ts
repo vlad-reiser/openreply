@@ -80,4 +80,10 @@ describe("follow-up steps", () => {
     // 10:00 + 2 h = 12:00 → unchanged, and no spread added.
     expect(stepDelayMs(step, new Date("2026-11-22T09:00:00Z"), 60_000)).toBe(2 * 3_600_000);
   });
+
+  it("reads om-ej-klick", () => {
+    const steps = parseSteps("[steg]\nefter: 180\nom-ej-klick: ja\nHann du öppna den?");
+    expect(steps?.[0]).toMatchObject({ delayMinutes: 180, onlyIfNoClick: true, message: "Hann du öppna den?" });
+    expect(parseSteps("[steg]\nHej")?.[0].onlyIfNoClick).toBe(false);
+  });
 });

@@ -60,6 +60,7 @@ import {
   type FollowUpStep,
 } from "@/lib/tracking/steps";
 import { sendDirectMessageCard } from "@/lib/meta/client";
+import { STORY_MENTION_KEYWORD } from "@/lib/meta/webhook";
 import { hashRecipientId } from "@/lib/tracking/server";
 
 import { ZernioApiError } from "@/lib/zernio/client";
@@ -203,6 +204,17 @@ type RevealAutomation = {
   instagramAccount: { instagramId: string };
 };
 
+function sameUrl(a: string, b: string): boolean {
+  return a.replace(/\/$/, "") === b.replace(/\/$/, "");
+}
+
+function trackedLinkFor(
+  url: string,
+  trackedLinks: WorkerTrackedLink[]
+): WorkerTrackedLink | null {
+  return trackedLinks.find((link) => sameUrl(link.destinationUrl, url)) ?? null;
+}
+
 /**
  * Send a message that may end with a `[kort]` block: a short text, then the
  * link as an image card with a button. If Meta rejects the card (or the
@@ -215,6 +227,7 @@ async function sendTextAndCard({
   message,
   commenterName,
   context,
+  trackedLinks = [],
 }: {
   accessToken: InstagramContext;
   instagramId: string;
@@ -222,10 +235,22 @@ async function sendTextAndCard({
   message: string;
   commenterName: string | null;
   context: string;
+  trackedLinks?: WorkerTrackedLink[];
 }): Promise<void> {
   const personalize = (text: string) =>
     text.replace(/\{username\}/gi, commenterName ?? "").trim();
-  const { text, card } = parseCard(message);
+  const parsed = parseCard(message);
+  const text = parsed.text;
+  // A card whose link is one of the campaign's tracked links goes out through
+  // the click counter, so we know whether this person opened it.
+  const tracked = parsed.card ? trackedLinkFor(parsed.card.url, trackedLinks) : null;
+  const card =
+    parsed.card && tracked
+      ? {
+          ...parsed.card,
+          url: buildTrackedUrl(tracked.slug, undefined, hashRecipientId(userId)),
+        }
+      : parsed.card;
   if (!card || accessToken.provider !== "META") {
     await sendDirectMessage({
       context: accessToken,
@@ -284,7 +309,12 @@ async function sendRevealDirectMessage({
   context: string;
 }): Promise<void> {
   const { card } = parseCard(automation.dmMessage);
-  if (card && automation.trackedLinks.length === 0 && accessToken.provider === "META") {
+  if (
+    card &&
+    accessToken.provider === "META" &&
+    (automation.trackedLinks.length === 0 ||
+      trackedLinkFor(card.url, automation.trackedLinks))
+  ) {
     await sendTextAndCard({
       accessToken,
       instagramId: automation.instagramAccount.instagramId,
@@ -292,6 +322,7 @@ async function sendRevealDirectMessage({
       message: automation.dmMessage,
       commenterName,
       context,
+      trackedLinks: automation.trackedLinks,
     });
     return;
   }
@@ -374,6 +405,21 @@ type FollowUpSource = {
 // Same-message follow-ups are not repeated to one person within this window.
 const FOLLOWUP_REPEAT_DAYS = 90;
 
+// Instagram lets us message a person for 24 hours after they last wrote or
+// tapped. Follow-up steps stop an hour short of that, so a late job can never
+// land outside the window.
+const FOLLOWUP_WINDOW_MS = 23 * 3_600_000;
+
+function pastWindow(data: ProcessFollowUpJob, at: number): boolean {
+  return data.windowOpenedAt !== undefined && at > data.windowOpenedAt + FOLLOWUP_WINDOW_MS;
+}
+
+// Link scanners open links too; their visits do not count as the person's.
+const BOT_USER_AGENT = /bot|crawl|spider|preview|facebookexternalhit|facebot|scan/i;
+
+// How long after a Story mention the same person is not answered again.
+const STORY_MENTION_REPEAT_DAYS = 7;
+
 async function enqueueFollowUpStep(
   data: ProcessFollowUpJob,
   steps: FollowUpStep[],
@@ -383,11 +429,18 @@ async function enqueueFollowUpStep(
   if (!step) return;
   // Spread morning sends over a quarter of an hour instead of one minute.
   const spreadMs = 60_000 + Math.floor(Math.random() * 14 * 60_000);
+  const delay = stepDelayMs(step, new Date(), spreadMs);
+  if (pastWindow(data, Date.now() + delay)) {
+    console.log(
+      `[DM Worker] Follow-up step ${index + 1} would land outside the 24-hour window; sequence ends`
+    );
+    return;
+  }
   await getDMQueue().add(
     FOLLOWUP_JOB_NAME,
     { ...data, step: index },
     {
-      delay: stepDelayMs(step, new Date(), spreadMs),
+      delay,
       // Bucketed by hour: a burst of taps starts one sequence, and a retained
       // completed job never blocks a later one (see the follow re-check note).
       jobId: `followup_${data.automationId}_${data.userId}_s${index}_${Math.floor(Date.now() / 3_600_000)}`,
@@ -408,6 +461,7 @@ async function scheduleFollowUp(
     userId,
     automationId: automation.id,
     commenterName,
+    windowOpenedAt: Date.now(),
   };
   const steps = parseSteps(automation.followUpMessage);
   if (steps) {
@@ -1364,6 +1418,7 @@ async function sendFollowUpStep(
     workspaceId: string;
     instagramAccountId: string;
     instagramAccount: { instagramId: string };
+    trackedLinks: WorkerTrackedLink[];
   },
   steps: FollowUpStep[],
   accessToken: InstagramContext
@@ -1377,6 +1432,12 @@ async function sendFollowUpStep(
   // The delay was computed to land outside the quiet hours; a job that ran
   // late (worker restart, backlog) is pushed on rather than sent at night.
   const wait = msUntilAllowed(new Date(), step.quiet);
+  if (pastWindow(job.data, Date.now() + (wait > 0 ? wait + 60_000 : 0))) {
+    console.log(
+      `[DM Worker] Follow-up step ${index + 1} is outside the 24-hour window; not sent`
+    );
+    return;
+  }
   if (wait > 0) {
     await getDMQueue().add(FOLLOWUP_JOB_NAME, job.data, {
       delay: wait + 60_000,
@@ -1399,6 +1460,24 @@ async function sendFollowUpStep(
       select: { id: true },
     });
     if (used) {
+      await next();
+      return;
+    }
+  }
+
+  if (step.onlyIfNoClick) {
+    const clicks = await prisma.linkClick.findMany({
+      where: {
+        workspaceId: automation.workspaceId,
+        automationId: automation.id,
+        recipientHash: hashRecipientId(userId),
+        createdAt: {
+          gte: new Date(job.data.windowOpenedAt ?? Date.now() - 86_400_000),
+        },
+      },
+      select: { userAgent: true },
+    });
+    if (clicks.some((click) => !BOT_USER_AGENT.test(click.userAgent ?? ""))) {
       await next();
       return;
     }
@@ -1457,6 +1536,7 @@ async function sendFollowUpStep(
               message: step.message,
               commenterName,
               context: "follow-up step",
+              trackedLinks: automation.trackedLinks,
             }),
     });
     if (!delivered) return;
@@ -1503,7 +1583,13 @@ async function processStepReply(job: Job<ProcessPostbackJob>): Promise<void> {
 
   const automation = await prisma.automation.findFirst({
     where: { id: automationId, isActive: true, ...connectionScope(job.data) },
-    include: { instagramAccount: true },
+    include: {
+      instagramAccount: true,
+      trackedLinks: {
+        select: { slug: true, label: true, destinationUrl: true },
+        orderBy: TRACKED_LINK_ORDER,
+      },
+    },
   });
   if (
     !automation ||
@@ -1570,6 +1656,7 @@ async function processStepReply(job: Job<ProcessPostbackJob>): Promise<void> {
           message: reply,
           commenterName,
           context: "follow-up step reply",
+          trackedLinks: automation.trackedLinks,
         }),
     });
     if (!delivered) return;
@@ -1608,7 +1695,13 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
 
   const automation = await prisma.automation.findFirst({
     where: { id: automationId, isActive: true, ...connectionScope(job.data) },
-    include: { instagramAccount: true },
+    include: {
+      instagramAccount: true,
+      trackedLinks: {
+        select: { slug: true, label: true, destinationUrl: true },
+        orderBy: TRACKED_LINK_ORDER,
+      },
+    },
   });
 
   if (
@@ -1667,6 +1760,7 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
  */
 async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   const { instagramAccountId, messageId, messageText, senderId } = job.data;
+  const storyMention = job.data.storyMention === true;
 
   const automations = await prisma.automation.findMany({
     where: {
@@ -1689,15 +1783,35 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   const dedupeId = `dm:${messageId}`;
 
   for (const automation of automations) {
-    const matchResult = automation.matchAnyWord
-      ? { matched: true, matchedKeyword: null }
-      : matchKeywords(
-          messageText,
-          automation.keywords,
-          automation.wholeWordMatch
-        );
+    // A Story mention is answered only by a campaign that names it as a
+    // keyword: "any word" campaigns are about what people write, not this.
+    const matchResult = storyMention
+      ? matchKeywords(STORY_MENTION_KEYWORD, automation.keywords, true)
+      : automation.matchAnyWord
+        ? { matched: true, matchedKeyword: null }
+        : matchKeywords(
+            messageText,
+            automation.keywords,
+            automation.wholeWordMatch
+          );
 
     if (!matchResult.matched) continue;
+
+    // Someone who mentions the account every day gets one answer a week.
+    if (storyMention) {
+      const recent = await prisma.dmLog.findFirst({
+        where: {
+          automationId: automation.id,
+          commenterId: senderId,
+          status: "SENT",
+          createdAt: {
+            gte: new Date(Date.now() - STORY_MENTION_REPEAT_DAYS * 86_400_000),
+          },
+        },
+        select: { id: true },
+      });
+      if (recent) continue;
+    }
 
     const existingLog = await prisma.dmLog.findUnique({
       where: {
