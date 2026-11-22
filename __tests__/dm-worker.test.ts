@@ -1045,6 +1045,34 @@ describe("DM Worker — DM keyword trigger", () => {
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
   });
 
+  it("sends the reveal directly, without the opening DM's button, and starts the follow-up", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...dmTriggerAutomation,
+        openingDmEnabled: true,
+        openingDmMessage: "Tryck på Ja så skickar jag den",
+        openingDmButtonLabel: "Ja!",
+        followUpEnabled: true,
+        followUpDelayMinutes: 0,
+        followUpMessage: "[steg]\nefter: 60\nOch en till",
+      },
+    ]);
+    await getProcessor()(createMockMessageJob());
+
+    expect(mockSendDirectMessageWithButton).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Hey commenter_user! Here is the link: https://example.com"
+    );
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-followup",
+      expect.objectContaining({ userId: "commenter_999", step: 0 }),
+      expect.objectContaining({ delay: 60 * 60_000 })
+    );
+  });
+
   it("should not reply when the DM text matches no keyword", async () => {
     mockMatchKeywords.mockReturnValue({ matched: false, matchedKeyword: null });
 

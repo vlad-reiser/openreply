@@ -64,6 +64,10 @@ import { hashRecipientId } from "@/lib/tracking/server";
 
 import { ZernioApiError } from "@/lib/zernio/client";
 
+// Whether a DM/Story-reply keyword gets the opening DM (with its button)
+// before the reveal, as comments do. Off by default: see processMessage.
+const DM_TRIGGER_OPENING_DM = process.env.DM_TRIGGER_OPENING_DM === "true";
+
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 
 // How long to wait before re-checking a follow that came back false: one
@@ -1787,11 +1791,12 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     // postback path's fail-open one. Fail-open is only safe after a tap, where
     // the user has already claimed to follow; here it would hand the link to
     // anyone whose status the API happens not to resolve.
-    // Same opening-DM flow as a comment: a DM (or Story reply) that matches
-    // gets the opening message with its button first, and the tap delivers
-    // the reveal (or the follow gate). Without this, DM triggers skipped the
-    // opening DM and sent the link straight away.
+    // A DM (or Story reply) has already opened the conversation, so the
+    // reveal goes out directly: the opening DM's button exists to get around
+    // the one-private-reply limit on comments, and here it only adds a step
+    // people drop out at. DM_TRIGGER_OPENING_DM=true sends it first anyway.
     const useOpeningDm =
+      DM_TRIGGER_OPENING_DM &&
       automation.openingDmEnabled &&
       Boolean(automation.openingDmMessage) &&
       Boolean(automation.openingDmButtonLabel);
